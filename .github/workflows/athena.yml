@@ -1,12 +1,55 @@
+# Canonical Athena CI — same file for every app repo.
+# Never put ATHENA_API_URL or ATHENA_API_KEY in this file.
+
+# Name shown in the Actions tab.
 name: Athena SAST
+
+# When to run: every push and every pull request.
+# Use pull_request (not the privileged fork-PR event).
 on:
   push:
   pull_request:
+
+# Least privilege: this workflow only needs to read the checkout.
 permissions:
   contents: read
+
 jobs:
-  scan:
+  # Job 1: regex/pattern OWASP gate. No engine. No secrets.
+  local-gate:
+    name: Local pipeline gate
     runs-on: ubuntu-latest
+    steps:
+      # Pin SHA (CICD-SEC-8). v5.1.0 = Node 24 (avoids Node 20 deprecation).
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # Do not leave GITHUB_TOKEN in local git config (CICD-SEC-4).
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Athena local
+        run: |
+          set +x
+          python3 -m pip install "athena-sast==1.1.1"
+          athena scan \
+            --local . \
+            --exclude '.github/**' \
+            --modes pipeline \
+            --fail-on high \
+            --format table
+
+  # Job 2: engine agents. Skipped until repo variable ATHENA_ENABLE_ENGINE=true.
+  engine:
+    name: Engine scan
+    if: ${{ vars.ATHENA_ENABLE_ENGINE == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      # Secrets from Settings. Never hardcoded.
+      ATHENA_API_URL: ${{ secrets.ATHENA_API_URL }}
+      ATHENA_API_KEY: ${{ secrets.ATHENA_API_KEY }}
+      # Private clone for the engine. Public repos still work with this.
+      ATHENA_REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -14,8 +57,37 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
-      - name: Athena scan
+      - name: Refuse cleartext engine URL
+        run: |
+          set +x
+          url="${ATHENA_API_URL:-}"
+          case "$url" in
+            "")
+              echo "ATHENA_API_URL is not set"
+              exit 2
+              ;;
+            https://*|http://127.0.0.1*|http://localhost*|http://[::1]*)
+              ;;
+            http://*)
+              echo "Refuse public HTTP engine URL (API key would travel in cleartext)."
+              exit 2
+              ;;
+            *)
+              echo "ATHENA_API_URL must be https://… (or loopback http for a self-hosted runner)"
+              exit 2
+              ;;
+          esac
+      - name: Athena engine
+        env:
+          # Pass via env (assignment), never splice github.head_ref into bash ${{ }}.
+          ATHENA_SCAN_REPO: ${{ github.server_url }}/${{ github.repository }}.git
+          ATHENA_SCAN_BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
           set +x
           python3 -m pip install "athena-sast==1.1.1"
-          athena scan --local . --exclude '.github/**' --fail-on high --format table
+          athena scan \
+            --repo "${ATHENA_SCAN_REPO}" \
+            --branch "${ATHENA_SCAN_BRANCH}" \
+            --modes code-review,secrets,iac,sca \
+            --fail-on high \
+            --format table
